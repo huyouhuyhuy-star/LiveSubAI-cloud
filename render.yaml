@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: livesub-ai-cloud-demo
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app_cloud:app --host 0.0.0.0 --port $PORT --no-access-log
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DEMO_TOKEN
+        sync: false
+      - key: SEGMENT_SECONDS
+        value: "6"
+      - key: MAX_ACTIVE_SESSIONS
+        value: "1"
+      - key: MAX_SESSION_SECONDS
+        value: "300"
+      - key: MAX_TOTAL_AUDIO_SECONDS
+        value: "1800"

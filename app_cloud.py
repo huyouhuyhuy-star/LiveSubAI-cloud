@@ -1,4 +1,4 @@
-"""LiveSub AI Cloud demo v0.7 — Android PCM16/WebSocket -> Groq STT -> EN/JA/ZH to Vietnamese.
+"""LiveSub AI Cloud demo v0.9 — Android PCM16/WebSocket -> Groq STT -> EN/JA/ZH to Vietnamese.
 
 Designed for a *limited, opt-in demo* on a free Render Web Service and
 Groq's rate-limited free API tier. Original Android WebSocket protocol unchanged.
@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import wave
 from array import array
@@ -20,13 +21,22 @@ from collections import deque
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-app = FastAPI(title="LiveSub AI Cloud", version="0.7.0")
+app = FastAPI(title="LiveSub AI Cloud", version="0.9.0")
 log = logging.getLogger("uvicorn.error")
 
 RATE = 16_000                   # Android sends 16kHz, signed PCM16, mono
 BYTES_PER_SECOND = RATE * 2
+# Four seconds between STT requests = at most 15 requests/minute, below the
+# common 20 RPM Whisper free-tier limit before accounting for other sessions.
 SEGMENT_SECONDS = max(4, min(12, int(os.getenv("SEGMENT_SECONDS", "4"))))
 SEGMENT_BYTES = BYTES_PER_SECOND * SEGMENT_SECONDS
+# Append the end of the preceding chunk to the next chunk, without increasing
+# the number of STT calls. A 4s cadence with 1s overlap -> 4s, 5s, 5s WAVs.
+AUDIO_OVERLAP_SECONDS = max(0, min(2, int(os.getenv("AUDIO_OVERLAP_SECONDS", "1"))))
+OVERLAP_BYTES = BYTES_PER_SECOND * AUDIO_OVERLAP_SECONDS
+# Bounded backpressure; do not silently drop old audio when inference is slow.
+MAX_AUDIO_QUEUE = max(1, min(6, int(os.getenv("MAX_AUDIO_QUEUE", "3"))))
+MAX_TRANSCRIPT_QUEUE = max(1, min(8, int(os.getenv("MAX_TRANSCRIPT_QUEUE", "4"))))
 MAX_SESSION_SECONDS = max(60, min(1800, int(os.getenv("MAX_SESSION_SECONDS", "300"))))
 MAX_ACTIVE_SESSIONS = max(1, min(4, int(os.getenv("MAX_ACTIVE_SESSIONS", "1"))))
 MAX_TOTAL_AUDIO_SECONDS = max(60, int(os.getenv("MAX_TOTAL_AUDIO_SECONDS", "1800")))
@@ -43,16 +53,18 @@ _slots_lock = asyncio.Lock()
 
 @app.get("/")
 def index() -> dict:
-    return {"service": "LiveSub AI Cloud v0.7", "status": "online", "health_url": "/health"}
+    return {"service": "LiveSub AI Cloud v0.9", "status": "online", "health_url": "/health"}
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "service": "LiveSub AI Cloud v0.7",
+    return {"ok": True, "service": "LiveSub AI Cloud v0.9",
             "groq_configured": bool(GROQ_API_KEY),
             "translation": "English/Japanese/Chinese speech -> Vietnamese subtitles",
             "source_languages": ["en", "ja", "zh"],
-            "segment_seconds": SEGMENT_SECONDS}
+            "segment_seconds": SEGMENT_SECONDS,
+            "audio_overlap_seconds": AUDIO_OVERLAP_SECONDS,
+            "pipeline": "capture -> transcribe -> translate"}
 
 
 def make_wav(pcm: bytes) -> bytes:
@@ -76,11 +88,51 @@ def has_voice_energy(pcm: bytes) -> bool:
     if not sampled:
         return False
     power = sum(float(s) ** 2 for s in sampled) / len(sampled)
-    return power ** 0.5 > 170
+    return power ** 0.5 > 130
 
 
 def clean_source(text: str) -> str:
     return " ".join(text.strip().split())[:750]
+
+
+def deduplicate_transcript(previous: str, current: str, language: str) -> str:
+    """Remove a *clearly repeated* prefix produced by overlapping WAV chunks.
+
+    Conservative by design: keeping an occasional duplicate is better than
+    erasing a legitimately repeated word. Punctuation and case are ignored for
+    overlap comparisons but the original spelling is preserved in the result.
+    """
+    current = clean_source(current)
+    if not previous or not current:
+        return current
+    if language == "en":
+        pattern = r"[\w]+(?:['’][\w]+)?"
+        past = list(re.finditer(pattern, previous, re.UNICODE))
+        now = list(re.finditer(pattern, current, re.UNICODE))
+        p = [m.group().casefold() for m in past]
+        n = [m.group().casefold() for m in now]
+        if p == n:
+            return ""
+        for amount in range(min(len(p), len(n)), 1, -1):
+            if p[-amount:] == n[:amount]:
+                return current[now[amount - 1].end():].lstrip(" ,.:;!?…—-\t")
+        return current
+
+    # Chinese and Japanese do not reliably use spaces between words. Trim only
+    # a *long* shared phrase (>=4 visible characters), not common syllables.
+    def visible_chars(value: str):
+        return [(m.group(), m.end()) for m in re.finditer(r"[^\W_]", value, re.UNICODE)]
+
+    past = visible_chars(previous)
+    now = visible_chars(current)
+    p = [c for c, _ in past]
+    n = [c for c, _ in now]
+    if p == n:
+        return ""
+    for amount in range(min(len(p), len(n)), 3, -1):
+        if p[-amount:] == n[:amount]:
+            return current[now[amount - 1][1]:].lstrip(" 、，。！？!?,.:;…\t")
+    return current
 
 
 async def groq_transcribe(client: httpx.AsyncClient, pcm: bytes, source_language: str = "en") -> str:
@@ -160,53 +212,83 @@ async def ws_subtitles(ws: WebSocket) -> None:
     await ws.accept()
     send_lock = asyncio.Lock()
     started = time.monotonic()
-    audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+    # The transcription worker may continue while the previous transcription
+    # is being translated. This greatly reduces avoidable sequential latency.
+    audio_queue: asyncio.Queue[tuple[bytes, str, int]] = asyncio.Queue(maxsize=MAX_AUDIO_QUEUE)
+    transcript_queue: asyncio.Queue[tuple[str, str, int]] = asyncio.Queue(maxsize=MAX_TRANSCRIPT_QUEUE)
     previous_sources: deque[str] = deque(maxlen=2)
-    previous_text = ""
+    previous_recognized = ""
     source_language = "en"
+    config_generation = 0
     configured = False
     buffer = bytearray()
-    segments_received = 0
+    overlap_tail = b""
     last_warning = 0.0
 
     async def send(kind: str, value: str, extra: dict | None = None) -> None:
         key = "text" if kind == "subtitle" else "message"
         async with send_lock:
             payload = {"type": kind, key: value}
-            if extra: payload.update(extra)
+            if extra:
+                payload.update(extra)
             await ws.send_text(json.dumps(payload, ensure_ascii=False))
 
-    async def translate_worker() -> None:
-        nonlocal previous_text
-        async with httpx.AsyncClient(timeout=45, follow_redirects=False) as client:
-            while True:
-                chunk = await audio_queue.get()
+    async def transcribe_worker(client: httpx.AsyncClient) -> None:
+        nonlocal previous_recognized
+        while True:
+            pcm_chunk, lang, generation = await audio_queue.get()
+            try:
+                if generation != config_generation or not has_voice_energy(pcm_chunk):
+                    continue
+                recognized = await groq_transcribe(client, pcm_chunk, lang)
+                if generation != config_generation:
+                    continue
+                if not recognized or recognized.casefold().strip(".,! ?") in {
+                    "thank you for watching", "you", "subtitles by the amara.org community"
+                }:
+                    continue
+                fresh = deduplicate_transcript(previous_recognized, recognized, lang)
+                previous_recognized = recognized
+                if fresh:
+                    # Backpressure instead of dropping recognized text.
+                    await transcript_queue.put((fresh, lang, generation))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Transcription failed: %s", type(exc).__name__)
                 try:
-                    # Not forwarding silent audio saves requests on the free plan.
-                    if not has_voice_energy(chunk):
-                        continue
-                    speech = await groq_transcribe(client, chunk, source_language)
-                    if not speech or speech.lower().strip(".,! ?") in {
-                        "thank you for watching", "you", "subtitles by the amara.org community"
-                    } or speech == previous_text:
-                        continue
-                    vi = await groq_translate(client, speech, list(previous_sources), source_language)
-                    previous_sources.append(speech)
-                    previous_text = speech
-                    if vi:
-                        await send("subtitle", vi, {"source_text": speech, "source_language": source_language})
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.warning("Translation request failed: %s", type(exc).__name__)
-                    try:
-                        await send("error", error_message(exc))
-                    except Exception:
-                        return
-                finally:
-                    audio_queue.task_done()
+                    await send("error", "Nhận diện tiếng nói: " + error_message(exc))
+                except Exception:
+                    return
+            finally:
+                audio_queue.task_done()
 
-    worker = asyncio.create_task(translate_worker())
+    async def translate_worker(client: httpx.AsyncClient) -> None:
+        while True:
+            speech, lang, generation = await transcript_queue.get()
+            try:
+                if generation != config_generation:
+                    continue
+                vi = await groq_translate(client, speech, list(previous_sources), lang)
+                if generation != config_generation:
+                    continue
+                previous_sources.append(speech)
+                if vi:
+                    await send("subtitle", vi, {"source_text": speech, "source_language": lang})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Translation failed: %s", type(exc).__name__)
+                try:
+                    await send("error", "Dịch phụ đề: " + error_message(exc))
+                except Exception:
+                    return
+            finally:
+                transcript_queue.task_done()
+
+    client = httpx.AsyncClient(timeout=45, follow_redirects=False)
+    workers = [asyncio.create_task(transcribe_worker(client)),
+               asyncio.create_task(translate_worker(client))]
     try:
         if not GROQ_API_KEY:
             await send("error", "Máy chủ chưa có GROQ_API_KEY. Hãy đặt Environment Variable trên Render.")
@@ -234,8 +316,11 @@ async def ws_subtitles(ws: WebSocket) -> None:
                             await send("error", "Ngôn ngữ nguồn không hợp lệ (chọn en/ja/zh).")
                             continue
                         source_language = selected
+                        config_generation += 1
                         previous_sources.clear()
-                        previous_text = ""
+                        previous_recognized = ""
+                        buffer.clear()
+                        overlap_tail = b""
                         configured = True
                         label = {"en": "Anh", "ja": "Nhật", "zh": "Trung"}[selected]
                         await send("status", f"Đã kết nối Cloud AI. Mở video tiếng {label} để thử.")
@@ -248,34 +333,32 @@ async def ws_subtitles(ws: WebSocket) -> None:
                 continue
             buffer.extend(pcm)
             while len(buffer) >= SEGMENT_BYTES:
-                chunk = bytes(buffer[:SEGMENT_BYTES]); del buffer[:SEGMENT_BYTES]
+                raw_chunk = bytes(buffer[:SEGMENT_BYTES])
+                del buffer[:SEGMENT_BYTES]
+                # Exact non-overlapping duration is used for quota accounting.
+                # Prepending the previous tail helps Whisper recognize cut words.
+                stt_chunk = overlap_tail + raw_chunk
+                overlap_tail = raw_chunk[-OVERLAP_BYTES:] if OVERLAP_BYTES else b""
                 async with _slots_lock:
                     if _total_audio_seconds + SEGMENT_SECONDS > MAX_TOTAL_AUDIO_SECONDS:
                         await send("error", "Đã hết hạn mức âm thanh demo của máy chủ.")
                         return
                     _total_audio_seconds += SEGMENT_SECONDS
-                segments_received += 1
-                if audio_queue.full():
-                    # Drop stale audio rather than progressively lagging behind the video.
-                    try:
-                        audio_queue.get_nowait()
-                        audio_queue.task_done()
-                    except asyncio.QueueEmpty:
-                        pass
-                    if time.monotonic() - last_warning > 20:
-                        await send("status", "AI xử lý chưa kịp; đang bỏ đoạn cũ để giảm trễ.")
-                        last_warning = time.monotonic()
-                audio_queue.put_nowait(chunk)
+                if audio_queue.full() and time.monotonic() - last_warning > 10:
+                    await send("status", "Groq đang xử lý chậm; giữ âm thanh trong hàng đợi để tránh mất từ.")
+                    last_warning = time.monotonic()
+                # Preserve audio in order. Backpressure may cause delay during
+                # overload; cannot promise both zero loss and zero latency.
+                await audio_queue.put((stt_chunk, source_language, config_generation))
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         log.info("WebSocket disconnected: %s", type(exc).__name__)
     finally:
-        worker.cancel()
-        try:
-            await worker
-        except asyncio.CancelledError:
-            pass
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        await client.aclose()
         async with _slots_lock:
             _active_sessions = max(0, _active_sessions - 1)
         try:

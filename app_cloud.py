@@ -1,4 +1,4 @@
-"""LiveSub AI Cloud demo v0.3 — Android PCM16/WebSocket -> Groq STT -> EN/VI.
+"""LiveSub AI Cloud demo v0.7 — Android PCM16/WebSocket -> Groq STT -> EN/JA/ZH to Vietnamese.
 
 Designed for a *limited, opt-in demo* on a free Render Web Service and
 Groq's rate-limited free API tier. Original Android WebSocket protocol unchanged.
@@ -20,12 +20,12 @@ from collections import deque
 import httpx
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-app = FastAPI(title="LiveSub AI Cloud", version="0.3.0")
+app = FastAPI(title="LiveSub AI Cloud", version="0.7.0")
 log = logging.getLogger("uvicorn.error")
 
 RATE = 16_000                   # Android sends 16kHz, signed PCM16, mono
 BYTES_PER_SECOND = RATE * 2
-SEGMENT_SECONDS = max(4, min(12, int(os.getenv("SEGMENT_SECONDS", "6"))))
+SEGMENT_SECONDS = max(4, min(12, int(os.getenv("SEGMENT_SECONDS", "4"))))
 SEGMENT_BYTES = BYTES_PER_SECOND * SEGMENT_SECONDS
 MAX_SESSION_SECONDS = max(60, min(1800, int(os.getenv("MAX_SESSION_SECONDS", "300"))))
 MAX_ACTIVE_SESSIONS = max(1, min(4, int(os.getenv("MAX_ACTIVE_SESSIONS", "1"))))
@@ -33,7 +33,7 @@ MAX_TOTAL_AUDIO_SECONDS = max(60, int(os.getenv("MAX_TOTAL_AUDIO_SECONDS", "1800
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 DEMO_TOKEN = os.getenv("DEMO_TOKEN", "").strip()
 STT_MODEL = os.getenv("STT_MODEL", "whisper-large-v3-turbo")
-TRANSLATION_MODEL = os.getenv("TRANSLATION_MODEL", "llama-3.3-70b-versatile")
+TRANSLATION_MODEL = os.getenv("TRANSLATION_MODEL", "openai/gpt-oss-120b")
 API_BASE = "https://api.groq.com/openai/v1"
 
 _active_sessions = 0
@@ -43,14 +43,15 @@ _slots_lock = asyncio.Lock()
 
 @app.get("/")
 def index() -> dict:
-    return {"service": "LiveSub AI Cloud v0.3", "status": "online", "health_url": "/health"}
+    return {"service": "LiveSub AI Cloud v0.7", "status": "online", "health_url": "/health"}
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "service": "LiveSub AI Cloud v0.3",
+    return {"ok": True, "service": "LiveSub AI Cloud v0.7",
             "groq_configured": bool(GROQ_API_KEY),
-            "translation": "English voice -> Vietnamese subtitles",
+            "translation": "English/Japanese/Chinese speech -> Vietnamese subtitles",
+            "source_languages": ["en", "ja", "zh"],
             "segment_seconds": SEGMENT_SECONDS}
 
 
@@ -82,37 +83,45 @@ def clean_source(text: str) -> str:
     return " ".join(text.strip().split())[:750]
 
 
-async def groq_transcribe(client: httpx.AsyncClient, pcm: bytes) -> str:
+async def groq_transcribe(client: httpx.AsyncClient, pcm: bytes, source_language: str = "en") -> str:
     """Only the server has GROQ_API_KEY. Never send this key to Android."""
     response = await client.post(
         f"{API_BASE}/audio/transcriptions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
         files={"file": ("segment.wav", make_wav(pcm), "audio/wav")},
-        data={"model": STT_MODEL, "language": "en", "response_format": "json", "temperature": "0"},
+        data={"model": STT_MODEL, "language": source_language, "response_format": "json", "temperature": "0"},
     )
     response.raise_for_status()
     return clean_source(response.json().get("text", ""))
 
 
-async def groq_translate(client: httpx.AsyncClient, text: str, history: list[str]) -> str:
+async def groq_translate(client: httpx.AsyncClient, text: str, history: list[str], source_language: str = "en") -> str:
     history_str = " / ".join(history[-2:])
+    source_name = {"en": "English", "ja": "Japanese", "zh": "Mandarin Chinese"}.get(source_language, "English")
+    # GPT-OSS tends to reason before answering. 'low' reduces latency for short captions.
+    body = {
+        "model": TRANSLATION_MODEL,
+        "temperature": 0,
+        "max_tokens": 220,
+        "messages": [
+            {"role": "system", "content": (
+                f"You translate {source_name} speech into natural, accurate Vietnamese video subtitles. "
+                "Translate only the CURRENT source-language text. Retain names, numbers and meaning. "
+                "Previous source-language excerpts are context only, DO NOT translate them again. "
+                "Be concise. Preserve normal Vietnamese punctuation. "
+                "Place each COMPLETE Vietnamese sentence on its own line; do not use bullets or labels. "
+                "Output ONLY Vietnamese subtitle text, no explanation."
+            )},
+            {"role": "user", "content": f"Previous excerpts: {history_str or '(none)'}\nCURRENT: {text}"},
+        ],
+    }
+    if TRANSLATION_MODEL in ("openai/gpt-oss-20b", "openai/gpt-oss-120b"):
+        body["reasoning_effort"] = "low"
+        body["include_reasoning"] = False
     response = await client.post(
         f"{API_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={
-            "model": TRANSLATION_MODEL,
-            "temperature": 0,
-            "max_tokens": 220,
-            "messages": [
-                {"role": "system", "content": (
-                    "You translate English speech into natural, accurate Vietnamese video subtitles. "
-                    "Translate only the CURRENT English text. Retain names, numbers and meaning. "
-                    "Previous English excerpts are context only, DO NOT translate them again. "
-                    "Be concise. Output ONLY Vietnamese subtitle text, no explanation or formatting."
-                )},
-                {"role": "user", "content": f"Previous excerpts: {history_str or '(none)'}\nCURRENT: {text}"},
-            ],
-        },
+        json=body,
     )
     response.raise_for_status()
     data = response.json()
@@ -127,7 +136,7 @@ def error_message(exc: Exception) -> str:
         if status in (401, 403):
             return "API key Groq không hợp lệ hoặc chưa được cấp quyền."
         if status == 400:
-            return "Yêu cầu AI không hợp lệ. Kiểm tra model trong Render."
+            return "Yêu cầu AI không hợp lệ. Kiểm tra STT_MODEL và TRANSLATION_MODEL trong Render."
         return f"Dịch vụ AI đang lỗi HTTP {status}."
     if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError)):
         return "Máy chủ cloud tạm thời không liên lạc được với Groq."
@@ -154,15 +163,18 @@ async def ws_subtitles(ws: WebSocket) -> None:
     audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
     previous_sources: deque[str] = deque(maxlen=2)
     previous_text = ""
+    source_language = "en"
     configured = False
     buffer = bytearray()
     segments_received = 0
     last_warning = 0.0
 
-    async def send(kind: str, value: str) -> None:
+    async def send(kind: str, value: str, extra: dict | None = None) -> None:
         key = "text" if kind == "subtitle" else "message"
         async with send_lock:
-            await ws.send_text(json.dumps({"type": kind, key: value}, ensure_ascii=False))
+            payload = {"type": kind, key: value}
+            if extra: payload.update(extra)
+            await ws.send_text(json.dumps(payload, ensure_ascii=False))
 
     async def translate_worker() -> None:
         nonlocal previous_text
@@ -173,16 +185,16 @@ async def ws_subtitles(ws: WebSocket) -> None:
                     # Not forwarding silent audio saves requests on the free plan.
                     if not has_voice_energy(chunk):
                         continue
-                    speech = await groq_transcribe(client, chunk)
+                    speech = await groq_transcribe(client, chunk, source_language)
                     if not speech or speech.lower().strip(".,! ?") in {
                         "thank you for watching", "you", "subtitles by the amara.org community"
                     } or speech == previous_text:
                         continue
-                    vi = await groq_translate(client, speech, list(previous_sources))
+                    vi = await groq_translate(client, speech, list(previous_sources), source_language)
                     previous_sources.append(speech)
                     previous_text = speech
                     if vi:
-                        await send("subtitle", vi)
+                        await send("subtitle", vi, {"source_text": speech, "source_language": source_language})
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -215,10 +227,18 @@ async def ws_subtitles(ws: WebSocket) -> None:
                     continue
                 if msg.get("type") == "config":
                     if msg.get("target_language", "vi") != "vi":
-                        await send("error", "Bản demo hiện hỗ trợ tiếng Việt (dịch từ tiếng Anh).")
+                        await send("error", "Bản demo chỉ hỗ trợ ngôn ngữ đích là tiếng Việt.")
                     else:
+                        selected = msg.get("source_language", "en")
+                        if selected not in ("en", "ja", "zh"):
+                            await send("error", "Ngôn ngữ nguồn không hợp lệ (chọn en/ja/zh).")
+                            continue
+                        source_language = selected
+                        previous_sources.clear()
+                        previous_text = ""
                         configured = True
-                        await send("status", "Đã kết nối Cloud AI. Mở video tiếng Anh để thử.")
+                        label = {"en": "Anh", "ja": "Nhật", "zh": "Trung"}[selected]
+                        await send("status", f"Đã kết nối Cloud AI. Mở video tiếng {label} để thử.")
                 continue
             pcm = message.get("bytes")
             if not pcm or not configured:
